@@ -38,7 +38,9 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#ifndef _WIN32
 #include <termios.h>
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -47,12 +49,17 @@
 #include <ctype.h>
 #include <time.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <sys/ioctl.h>
+#endif
 #include <sys/time.h>
 #include <unistd.h>
 #include <stdarg.h>
 #include <fcntl.h>
 #include <signal.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 /* Syntax highlight types */
 #define HL_NORMAL 0
@@ -140,6 +147,12 @@ enum KEY_ACTION{
 
 void editorSetStatusMessage(const char *fmt, ...);
 
+#ifdef _WIN32
+ssize_t getline(char **lineptr, size_t *n, FILE *stream);
+ssize_t _READ(int fd, void *buf, size_t count);
+#define read(...) _READ(__VA_ARGS__)
+#endif
+
 /* =========================== Syntax highlights DB =========================
  *
  * In order to add a new syntax, define two arrays with a list of file name
@@ -199,8 +212,13 @@ struct editorSyntax HLDB[] = {
 
 /* ======================= Low level terminal handling ====================== */
 
+#ifndef _WIN32
 static struct termios orig_termios; /* In order to restore at exit.*/
+#else
+static DWORD orig_mode;
+#endif
 
+#ifndef _WIN32
 void disableRawMode(int fd) {
     /* Don't even check the return value as it's too late. */
     if (E.rawmode) {
@@ -208,12 +226,21 @@ void disableRawMode(int fd) {
         E.rawmode = 0;
     }
 }
+#else 
+void disableRawMode(int unused __attribute__((unused))) {
+	if (E.rawmode) {
+        SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE),orig_mode);
+        E.rawmode = 0;
+    }
+}
+#endif
 
 /* Called at exit to avoid remaining in raw mode. */
 void editorAtExit(void) {
     disableRawMode(STDIN_FILENO);
 }
 
+#ifndef _WIN32
 /* Raw mode: 1960 magic shit. */
 int enableRawMode(int fd) {
     struct termios raw;
@@ -247,13 +274,35 @@ fatal:
     errno = ENOTTY;
     return -1;
 }
+#else
+int enableRawMode(int unused __attribute__((unused))) {
+	DWORD rawmode;
+	//DWORD rawmode2;
+	
+	if (E.rawmode) return 0;
+    if (!isatty(STDIN_FILENO)) goto fatal;
+    atexit(editorAtExit);
+    if (!GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE),&orig_mode)) goto fatal;
+    
+    rawmode = ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT;
+    
+    if (!SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE),rawmode)) goto fatal;
+
+    E.rawmode = 1;
+    return 0;
+
+fatal:
+    errno = ENOTTY;
+    return -1;
+}
+#endif
 
 /* Read a key from the terminal put in raw mode, trying to handle
  * escape sequences. */
 int editorReadKey(int fd) {
     int nread;
     char c, seq[3];
-    while ((nread = read(fd,&c,1)) == 0);
+    while ((nread = read(fd,&c,1)) == 0); 
     if (nread == -1) exit(1);
 
     while(1) {
@@ -325,13 +374,34 @@ int getCursorPosition(int ifd, int ofd, int *rows, int *cols) {
     return 0;
 }
 
+#ifdef _WIN32
+struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+};
+
+int gws_return_struct_winsize(struct winsize * ws) {
+	CONSOLE_SCREEN_BUFFER_INFO consoleInfo;
+    if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE),&consoleInfo)) return 0;
+  
+    ws->ws_row = consoleInfo.srWindow.Bottom - consoleInfo.srWindow.Top + 1;
+    ws->ws_col = consoleInfo.srWindow.Right - consoleInfo.srWindow.Left + 1;
+
+    return 1;
+}
+#endif
+
 /* Try to get the number of columns in the current terminal. If the ioctl()
  * call fails the function will try to query the terminal itself.
  * Returns 0 on success, -1 on error. */
 int getWindowSize(int ifd, int ofd, int *rows, int *cols) {
     struct winsize ws;
 
+	#ifndef _WIN32
     if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+	#else
+	if (!gws_return_struct_winsize(&ws) || ws.ws_col == 0) {
+	#endif
         /* ioctl() failed. Try to query the terminal itself. */
         int orig_row, orig_col, retval;
 
@@ -1267,12 +1337,14 @@ void updateWindowSize(void) {
     E.screenrows -= 2; /* Get room for status bar. */
 }
 
+#ifndef _WIN32
 void handleSigWinCh(int unused __attribute__((unused))) {
     updateWindowSize();
     if (E.cy > E.screenrows) E.cy = E.screenrows - 1;
     if (E.cx > E.screencols) E.cx = E.screencols - 1;
     editorRefreshScreen();
 }
+#endif
 
 void initEditor(void) {
     E.cx = 0;
@@ -1285,7 +1357,9 @@ void initEditor(void) {
     E.filename = NULL;
     E.syntax = NULL;
     updateWindowSize();
+    #ifndef _WIN32
     signal(SIGWINCH, handleSigWinCh);
+    #endif
 }
 
 int main(int argc, char **argv) {
@@ -1293,16 +1367,96 @@ int main(int argc, char **argv) {
         fprintf(stderr,"Usage: kilo <filename>\n");
         exit(1);
     }
-
+	
     initEditor();
     editorSelectSyntaxHighlight(argv[1]);
     editorOpen(argv[1]);
     enableRawMode(STDIN_FILENO);
     editorSetStatusMessage(
         "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
+
     while(1) {
         editorRefreshScreen();
         editorProcessKeypress(STDIN_FILENO);
     }
     return 0;
 }
+
+#ifdef _WIN32
+/* From https://github.com/imbajin/DIY/blob/57076f023d8d784458b8cd471eea131ec7360499/db.c */
+ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
+    size_t pos;
+    int c;
+
+    if (lineptr == NULL || stream == NULL || n == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    c = fgetc(stream);
+    if (c == EOF) {
+        return -1;
+    }
+
+    if (*lineptr == NULL) {
+        *lineptr = malloc(128); //auto malloc space
+        if (*lineptr == NULL) {
+            return -1;
+        }
+        *n = 128;
+    }
+
+    pos = 0;
+    while(c != EOF) {
+        if (pos + 1 >= *n) {
+            size_t new_size = *n + (*n >> 2);
+            if (new_size < 128) {
+                new_size = 128;
+            }
+            char *new_ptr = realloc(*lineptr, new_size);
+            if (new_ptr == NULL) {
+                return -1;
+            }
+            *n = new_size;
+            *lineptr = new_ptr;
+        }
+
+        ((unsigned char *)(*lineptr))[pos ++] = c;
+        if (c == '\n') { //end when meet '\n',but doesn't drop it.
+            break;
+        }
+        c = fgetc(stream);
+    }
+
+    (*lineptr)[pos] = '\0';
+    return pos;
+}
+
+ssize_t _READ(int fd, void *buf, size_t count) {
+    HANDLE hConsole = (HANDLE)_get_osfhandle(fd);
+    DWORD bytesRead;
+    
+    if (hConsole == INVALID_HANDLE_VALUE || hConsole == NULL) {
+        errno = EBADF;
+        return -1;
+    }
+	if (WaitForSingleObject(hConsole, 100) == WAIT_TIMEOUT) return 0;
+    if (!ReadConsole(hConsole, buf, count, &bytesRead, NULL)) {
+        switch (GetLastError()) {
+            case ERROR_BROKEN_PIPE:
+                errno = EPIPE;
+                break;
+            case ERROR_INVALID_HANDLE:
+                errno = EBADF;
+                break;
+            default:
+                errno = EIO;
+                break;
+        }
+        return -1;
+    }
+
+    return (ssize_t)bytesRead;
+}
+
+#endif

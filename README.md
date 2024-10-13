@@ -1,3 +1,9 @@
+Kilo for Windows
+================
+This is Kilo for Windows, the Windows port of [Kilo](https://github.com/antirez/kilo).
+To compile Kilo, you need to install [mingw-w64](https://github.com/mingw-w64/mingw-w64).
+kilo.c can also be compiled under Linux.
+
 Kilo
 ===
 
